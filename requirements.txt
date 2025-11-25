@@ -1,0 +1,58 @@
+# ============================================================================
+# KaVa Multi-Teacher KV Distillation - Requirements
+# ============================================================================
+# 在 HPC 上使用: pip install -r requirements.txt
+
+# -------------------- 核心深度学习框架 --------------------
+torch>=2.0.0
+transformers>=4.57.0
+accelerate>=0.20.3
+datasets>=2.14.0
+huggingface_hub>=1.1.0
+peft>=0.4.0  # LoRA support
+
+# -------------------- 科学计算与统计 --------------------
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+
+# -------------------- 可视化 --------------------
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# -------------------- 数据处理 --------------------
+pandas>=2.0.0
+tqdm>=4.65.0
+
+# -------------------- 日志与监控 --------------------
+tensorboard>=2.13.0
+# wandb>=0.15.0  # Optional: uncomment if using W&B
+
+# -------------------- 工具库 --------------------
+pyyaml>=6.0
+jsonlines>=3.1.0
+
+# ============================================================================
+# HPC 安装步骤（保存此文件到 HPC 后执行）
+# ============================================================================
+# 
+# 1. 加载 Python 模块:
+#    module load python/3.11  # 或 module load anaconda3
+#
+# 2. 创建虚拟环境:
+#    python -m venv kava_env
+#    source kava_env/bin/activate
+#
+# 3. 升级 pip:
+#    pip install --upgrade pip
+#
+# 4. 安装所有依赖:
+#    pip install -r requirements.txt
+#
+# 5. 验证安装:
+#    python -c "import torch; print('PyTorch:', torch.__version__)"
+#    python -c "import matplotlib; print('Matplotlib:', matplotlib.__version__)"
+#    python -c "import scipy; print('SciPy:', scipy.__version__)"
+#    python -c "import sklearn; print('scikit-learn:', sklearn.__version__)"
+#
+# ============================================================================

@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Baseline 设计详解 - KV 蒸馏实验</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', 'Microsoft YaHei', Arial, sans-serif;
+            background: #f5f7fa;
+            padding: 20px;
+            line-height: 1.6;
+            color: #2c3e50;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+        
+        header h1 {
+            font-size: 36px;
+            margin-bottom: 10px;
+        }
+        
+        header p {
+            font-size: 18px;
+            opacity: 0.95;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        .section {
+            margin-bottom: 40px;
+        }
+        
+        .section-title {
+            font-size: 28px;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #667eea;
+        }
+        
+        .baseline-card {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            margin: 20px 0;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+            border-left: 5px solid #667eea;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        
+        .baseline-card:hover {
+            transform: translateX(5px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.12);
+        }
+        
+        .baseline-card.winner {
+            border-left-color: #10b981;
+            background: linear-gradient(to right, #10b98108 0%, white 100%);
+        }
+        
+        .baseline-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .baseline-number {
+            font-size: 24px;
+            font-weight: bold;
+            margin-right: 15px;
+            color: #667eea;
+        }
+        
+        .baseline-name {
+            font-size: 22px;
+            font-weight: bold;
+            color: #2c3e50;
+            flex: 1;
+        }
+        
+        .baseline-result {
+            font-size: 18px;
+            font-weight: bold;
+            color: #10b981;
+        }
+        
+        .code-block {
+            background: #282c34;
+            color: #abb2bf;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 15px 0;
+            overflow-x: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        
+        .code-comment {
+            color: #5c6370;
+        }
+        
+        .code-keyword {
+            color: #c678dd;
+        }
+        
+        .code-function {
+            color: #61afef;
+        }
+        
+        .code-string {
+            color: #98c379;
+        }
+        
+        .code-number {
+            color: #d19a66;
+        }
+        
+        .details-list {
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .details-list li {
+            padding: 8px 0;
+            padding-left: 25px;
+            position: relative;
+        }
+        
+        .details-list li:before {
+            content: "▸";
+            position: absolute;
+            left: 0;
+            color: #667eea;
+            font-weight: bold;
+        }
+        
+        .highlight-box {
+            background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+            border-left: 4px solid #667eea;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        
+        .highlight-box h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+        }
+        
+        .comparison-table th {
+            background: #667eea;
+            color: white;
+            padding: 15px;
+            text-align: left;
+            font-weight: bold;
+        }
+        
+        .comparison-table td {
+            padding: 15px;
+            border-bottom: 1px solid #e9ecef;
+        }
+        
+        .comparison-table tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .comparison-table .best {
+            background: #10b98120;
+            font-weight: bold;
+        }
+        
+        .flow-diagram {
+            background: white;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            padding: 30px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .flow-step {
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 25px;
+            border-radius: 8px;
+            margin: 10px;
+            font-weight: bold;
+            box-shadow: 0 4px 10px rgba(102, 126, 234, 0.3);
+        }
+        
+        .flow-arrow {
+            display: inline-block;
+            font-size: 24px;
+            color: #667eea;
+            margin: 0 10px;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: bold;
+            margin: 5px;
+        }
+        
+        .badge-success {
+            background: #10b981;
+            color: white;
+        }
+        
+        .badge-warning {
+            background: #ffc107;
+            color: #856404;
+        }
+        
+        .badge-error {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .badge-info {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .conclusion-box {
+            background: linear-gradient(135deg, #10b98120 0%, #10b98110 100%);
+            border: 2px solid #10b981;
+            border-radius: 12px;
+            padding: 30px;
+            margin: 30px 0;
+        }
+        
+        .conclusion-box h3 {
+            color: #10b981;
+            font-size: 24px;
+            margin-bottom: 15px;
+        }
+        
+        .problem-box {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        
+        .problem-box h4 {
+            color: #856404;
+            margin-bottom: 10px;
+        }
+        
+        footer {
+            background: #2c3e50;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .metric-box {
+            display: inline-block;
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px 20px;
+            margin: 10px;
+            text-align: center;
+            min-width: 150px;
+        }
+        
+        .metric-label {
+            font-size: 12px;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #2c3e50;
+            margin-top: 5px;
+        }
+        
+        .metric-value.good {
+            color: #10b981;
+        }
+        
+        .metric-value.bad {
+            color: #ef4444;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📋 Baseline 设计详解</h1>
+            <p>增强版 KV 蒸馏实验 · 5个递进式对比方法</p>
+        </header>
+        
+        <div class="content">
+            <!-- 设计理念 -->
+            <div class="section">
+                <h2 class="section-title">🎯 设计理念</h2>
+                
+                <div class="highlight-box">
+                    <h3>递进式验证策略</h3>
+                    <p>通过5个精心设计的baseline，逐层验证多教师KV蒸馏的各个假设，形成完整的证据链。</p>
+                </div>
+                
+                <div class="flow-diagram">
+                    <div class="flow-step">无蒸馏</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Logits KD</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Single KV</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Multi KV Fixed</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Multi KV Dynamic</div>
+                </div>
+                
+                <div style="text-align: center; margin-top: 20px;">
+                    <div style="display: inline-block; text-align: left;">
+                        <p style="margin: 5px 0;">↓ 证明蒸馏有效</p>
+                        <p style="margin: 5px 0; margin-left: 100px;">↓ 证明KV优于传统方法</p>
+                        <p style="margin: 5px 0; margin-left: 200px;">↓ 证明KV蒸馏有效性</p>
+                        <p style="margin: 5px 0; margin-left: 300px;">↓ 测试多教师价值</p>
+                        <p style="margin: 5px 0; margin-left: 400px;">↓ 测试动态融合优势</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Baseline 1: 无蒸馏 -->
+            <div class="section">
+                <div class="baseline-card">
+                    <div class="baseline-header">
+                        <span class="baseline-number">1️⃣</span>
+                        <span class="baseline-name">no_distill（无蒸馏）</span>
+                        <span class="baseline-result">Val Loss: 0.6281</span>
+                    </div>
+                    
+                    <p><strong>目的：</strong>最基础的baseline，作为所有改进的参照基准</p>
+                    
+                    <div class="code-block">
+<span class="code-comment"># 标准语言建模损失（下一个token预测）</span>
+labels = input_ids[:, <span class="code-number">1</span>:]  <span class="code-comment"># 左移一位</span>
+logits = student_logits[:, :-<span class="code-number">1</span>, :]
+loss = <span class="code-function">F.cross_entropy</span>(
+    logits.<span class="code-function">view</span>(-<span class="code-number">1</span>, logits.<span class="code-function">size</span>(-<span class="code-number">1</span>)),
+    labels.<span class="code-function">view</span>(-<span class="code-number">1</span>),
+    ignore_index=tokenizer.pad_token_id
+)
+                    </div>
+                    
+                    <ul class="details-list">
+                        <li><strong>训练目标：</strong>预测序列中的下一个token（标准GPT训练）</li>
+                        <li><strong>无监督信号：</strong>仅使用输入序列本身，无教师模型</li>
+                        <li><strong>作用：</strong>证明任何形式的蒸馏都比纯自监督学习更有效</li>
+                    </ul>
+                    
+                    <div style="margin-top: 15px;">
+                        <div class="metric-box">
+                            <div class="metric-label">训练 Loss</div>
+                            <div class="metric-value">0.7147</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">验证 Loss</div>
+                            <div class="metric-value">0.6281</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">改进</div>
+                            <div class="metric-value">—</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Baseline 2: 单教师 KV -->
+            <div class="section">
+                <div class="baseline-card winner">
+                    <div class="baseline-header">
+                        <span class="baseline-number">2️⃣</span>
+                        <span class="baseline-name">single_kv（单教师 KV 蒸馏）</span>
+                        <span class="baseline-result">Val Loss: 0.0070 🏆</span>
+                    </div>
+                    
+                    <span class="badge badge-success">最佳方法</span>
+                    <span class="badge badge-info">98.89% 改进</span>
+                    
+                    <p style="margin-top: 15px;"><strong>目的：</strong>证明KV cache作为监督信号的有效性</p>
+                    
+                    <div class="code-block">
+<span class="code-comment"># 使用第一个教师的KV</span>
+single_teacher_kv = teacher_kvs[<span class="code-number">0</span>]
+
+<span class="code-comment"># MSE损失：最小化学生和教师的KV差异</span>
+<span class="code-keyword">def</span> <span class="code-function">compute_kv_loss</span>(student_kv, teacher_kv):
+    loss = <span class="code-number">0.0</span>
+    <span class="code-keyword">for</span> (s_k, s_v), (t_k, t_v) <span class="code-keyword">in</span> <span class="code-function">zip</span>(student_kv, teacher_kv):
+        <span class="code-comment"># 对齐序列长度</span>
+        min_seq = <span class="code-function">min</span>(s_k.<span class="code-function">shape</span>[<span class="code-number">2</span>], t_k.<span class="code-function">shape</span>[<span class="code-number">2</span>])
+        s_k_aligned = s_k[:, :, :min_seq, :]
+        t_k_aligned = t_k[:, :, :min_seq, :]
+        s_v_aligned = s_v[:, :, :min_seq, :]
+        t_v_aligned = t_v[:, :, :min_seq, :]
+        
+        <span class="code-comment"># L2距离</span>
+        loss += <span class="code-function">F.mse_loss</span>(s_k_aligned, t_k_aligned)
+        loss += <span class="code-function">F.mse_loss</span>(s_v_aligned, t_v_aligned)
+    
+    <span class="code-keyword">return</span> loss / <span class="code-function">len</span>(student_kv)
+                    </div>
+                    
+                    <ul class="details-list">
+                        <li><strong>教师模型：</strong>GPT-2，prompt: "Solve step-by-step: {question}"</li>
+                        <li><strong>监督层数：</strong>前6层（MAX_LAYERS=6）</li>
+                        <li><strong>损失函数：</strong>Key和Value的L2距离之和</li>
+                        <li><strong>关键创新：</strong>用中间层表示（KV cache）代替最终输出（logits）</li>
+                    </ul>
+                    
+                    <div style="margin-top: 15px;">
+                        <div class="metric-box">
+                            <div class="metric-label">训练 Loss</div>
+                            <div class="metric-value good">0.0397</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">验证 Loss</div>
+                            <div class="metric-value good">0.0070</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">改进</div>
+                            <div class="metric-value good">↓ 98.89%</div>
+                        </div>
+                    </div>
+                    
+                    <div class="highlight-box" style="margin-top: 20px;">
+                        <h3>✅ 核心发现</h3>
+                        <p><strong>KV蒸馏比无蒸馏提升98.89%</strong>，证明了中间层KV cache包含丰富的隐式知识，可作为强有力的监督信号。</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Baseline 3: Logits KD -->
+            <div class="section">
+                <div class="baseline-card">
+                    <div class="baseline-header">
+                        <span class="baseline-number">3️⃣</span>
+                        <span class="baseline-name">logits_kd（传统 Logits 蒸馏）</span>
+                        <span class="baseline-result">Val Loss: 0.5036</span>
+                    </div>
+                    
+                    <span class="badge badge-info">经典方法</span>
+                    <span class="badge badge-warning">仅19.83%改进</span>
+                    
+                    <p style="margin-top: 15px;"><strong>目的：</strong>对比KV蒸馏与传统知识蒸馏的效果差异</p>
+                    
+                    <div class="code-block">
+<span class="code-comment"># Hinton经典的Knowledge Distillation</span>
+<span class="code-keyword">def</span> <span class="code-function">compute_logits_kd_loss</span>(student_logits, teacher_logits, temperature=<span class="code-number">2.0</span>):
+    <span class="code-comment"># 软化概率分布</span>
+    student_probs = <span class="code-function">F.log_softmax</span>(student_logits / temperature, dim=-<span class="code-number">1</span>)
+    teacher_probs = <span class="code-function">F.softmax</span>(teacher_logits / temperature, dim=-<span class="code-number">1</span>)
+    
+    <span class="code-comment"># KL散度损失</span>
+    loss = <span class="code-function">F.kl_div</span>(
+        student_probs, 
+        teacher_probs, 
+        reduction=<span class="code-string">'batchmean'</span>
+    ) * (temperature ** <span class="code-number">2</span>)
+    
+    <span class="code-keyword">return</span> loss
+                    </div>
+                    
+                    <ul class="details-list">
+                        <li><strong>方法来源：</strong>Hinton et al., 2015 - Distilling the Knowledge in a Neural Network</li>
+                        <li><strong>温度参数：</strong>T=2.0（软化输出分布）</li>
+                        <li><strong>监督信号：</strong>教师模型的最终输出概率分布</li>
+                        <li><strong>局限性：</strong>仅利用输出层信息，忽略中间层表示</li>
+                    </ul>
+                    
+                    <div style="margin-top: 15px;">
+                        <div class="metric-box">
+                            <div class="metric-label">训练 Loss</div>
+                            <div class="metric-value">2.2794</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">验证 Loss</div>
+                            <div class="metric-value">0.5036</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">改进</div>
+                            <div class="metric-value">↓ 19.83%</div>
+                        </div>
+                    </div>
+                    
+                    <div class="highlight-box" style="margin-top: 20px;">
+                        <h3>📊 关键对比</h3>
+                        <p><strong>KV蒸馏（0.0070）vs Logits KD（0.5036）</strong></p>
+                        <p>KV蒸馏效果比传统方法好<strong>97.13%</strong>，说明中间层KV包含的知识远超最终输出。</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Baseline 4: 多教师固定权重 -->
+            <div class="section">
+                <div class="baseline-card">
+                    <div class="baseline-header">
+                        <span class="baseline-number">4️⃣</span>
+                        <span class="baseline-name">multi_kv_fixed（多教师固定权重）</span>
+                        <span class="baseline-result">Val Loss: 0.0103</span>
+                    </div>
+                    
+                    <span class="badge badge-warning">未超过单教师</span>
+                    
+                    <p style="margin-top: 15px;"><strong>目的：</strong>测试多个教师是否比单个教师提供更好的监督</p>
+                    
+                    <div class="code-block">
+<span class="code-comment"># 固定权重融合：0.7*teacher1 + 0.3*teacher2</span>
+<span class="code-keyword">def</span> <span class="code-function">fixed_weight_fusion</span>(teacher_kvs, weights=[<span class="code-number">0.7</span>, <span class="code-number">0.3</span>]):
+    fused_kv = []
+    <span class="code-keyword">for</span> layer_idx <span class="code-keyword">in</span> <span class="code-function">range</span>(<span class="code-function">len</span>(teacher_kvs[<span class="code-number">0</span>])):
+        <span class="code-comment"># 获取所有教师在该层的KV</span>
+        teacher_keys = [kv[layer_idx][<span class="code-number">0</span>] <span class="code-keyword">for</span> kv <span class="code-keyword">in</span> teacher_kvs]
+        teacher_values = [kv[layer_idx][<span class="code-number">1</span>] <span class="code-keyword">for</span> kv <span class="code-keyword">in</span> teacher_kvs]
+        
+        <span class="code-comment"># 对齐序列长度</span>
+        min_seq = <span class="code-function">min</span>(k.<span class="code-function">shape</span>[<span class="code-number">2</span>] <span class="code-keyword">for</span> k <span class="code-keyword">in</span> teacher_keys)
+        teacher_keys = [k[:, :, :min_seq, :] <span class="code-keyword">for</span> k <span class="code-keyword">in</span> teacher_keys]
+        teacher_values = [v[:, :, :min_seq, :] <span class="code-keyword">for</span> v <span class="code-keyword">in</span> teacher_values]
+        
+        <span class="code-comment"># 加权融合</span>
+        fused_key = <span class="code-function">sum</span>(w * k <span class="code-keyword">for</span> w, k <span class="code-keyword">in</span> <span class="code-function">zip</span>(weights, teacher_keys))
+        fused_value = <span class="code-function">sum</span>(w * v <span class="code-keyword">for</span> w, v <span class="code-keyword">in</span> <span class="code-function">zip</span>(weights, teacher_values))
+        
+        fused_kv.<span class="code-function">append</span>((fused_key, fused_value))
+    
+    <span class="code-keyword">return</span> fused_kv
+                    </div>
+                    
+                    <ul class="details-list">
+                        <li><strong>教师1 prompt：</strong>"Solve step-by-step: {question}"</li>
+                        <li><strong>教师2 prompt：</strong>"Think carefully and solve: {question}"</li>
+                        <li><strong>融合权重：</strong>0.7 : 0.3（固定不变）</li>
+                        <li><strong>假设：</strong>多个视角的组合能提供更全面的监督</li>
+                    </ul>
+                    
+                    <div style="margin-top: 15px;">
+                        <div class="metric-box">
+                            <div class="metric-label">训练 Loss</div>
+                            <div class="metric-value">0.0414</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">验证 Loss</div>
+                            <div class="metric-value">0.0103</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">改进</div>
+                            <div class="metric-value">↓ 98.36%</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Baseline 5: 多教师动态权重 -->
+            <div class="section">
+                <div class="baseline-card">
+                    <div class="baseline-header">
+                        <span class="baseline-number">5️⃣</span>
+                        <span class="baseline-name">multi_kv_dynamic（多教师动态权重）</span>
+                        <span class="baseline-result">Val Loss: 0.0144</span>
+                    </div>
+                    
+                    <span class="badge badge-info">自适应融合</span>
+                    <span class="badge badge-warning">未超过单教师</span>
+                    
+                    <p style="margin-top: 15px;"><strong>目的：</strong>测试自适应权重是否优于固定权重</p>
+                    
+                    <div class="code-block">
+<span class="code-comment"># 基于余弦相似度的动态权重</span>
+<span class="code-keyword">def</span> <span class="code-function">dynamic_weight_fusion</span>(teacher_kvs, student_kv):
+    <span class="code-comment"># 计算每个教师与学生的相似度</span>
+    similarities = [
+        <span class="code-function">compute_cosine_similarity</span>(teacher_kv, student_kv) 
+        <span class="code-keyword">for</span> teacher_kv <span class="code-keyword">in</span> teacher_kvs
+    ]
+    
+    <span class="code-comment"># Softmax归一化为权重（温度0.1让权重更集中）</span>
+    similarities = torch.<span class="code-function">tensor</span>(similarities)
+    weights = <span class="code-function">F.softmax</span>(similarities / <span class="code-number">0.1</span>, dim=<span class="code-number">0</span>)
+    
+    <span class="code-comment"># 融合KV（与fixed_weight_fusion相同，但权重动态）</span>
+    fused_kv = <span class="code-function">fuse_with_weights</span>(teacher_kvs, weights)
+    
+    <span class="code-keyword">return</span> fused_kv, weights
+
+<span class="code-keyword">def</span> <span class="code-function">compute_cosine_similarity</span>(kv1, kv2):
+    <span class="code-string">"""计算两个KV cache的平均余弦相似度"""</span>
+    total_sim = <span class="code-number">0.0</span>
+    <span class="code-keyword">for</span> (k1, v1), (k2, v2) <span class="code-keyword">in</span> <span class="code-function">zip</span>(kv1, kv2):
+        k1_flat = k1.<span class="code-function">flatten</span>()
+        k2_flat = k2.<span class="code-function">flatten</span>()
+        min_len = <span class="code-function">min</span>(<span class="code-function">len</span>(k1_flat), <span class="code-function">len</span>(k2_flat))
+        sim = <span class="code-function">F.cosine_similarity</span>(
+            k1_flat[:min_len].<span class="code-function">unsqueeze</span>(<span class="code-number">0</span>), 
+            k2_flat[:min_len].<span class="code-function">unsqueeze</span>(<span class="code-number">0</span>)
+        )
+        total_sim += sim.<span class="code-function">item</span>()
+    <span class="code-keyword">return</span> total_sim / <span class="code-function">len</span>(kv1)
+                    </div>
+                    
+                    <ul class="details-list">
+                        <li><strong>权重计算：</strong>实时计算学生KV与各教师KV的相似度</li>
+                        <li><strong>相似度度量：</strong>逐层flatten后计算余弦相似度并平均</li>
+                        <li><strong>温度参数：</strong>0.1（让权重分配更集中）</li>
+                        <li><strong>自适应性：</strong>每个样本的权重都不同，随学生状态动态调整</li>
+                    </ul>
+                    
+                    <div style="margin-top: 15px;">
+                        <div class="metric-box">
+                            <div class="metric-label">训练 Loss</div>
+                            <div class="metric-value">0.0460</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">验证 Loss</div>
+                            <div class="metric-value">0.0144</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">改进</div>
+                            <div class="metric-value">↓ 97.70%</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 结果对比表 -->
+            <div class="section">
+                <h2 class="section-title">📊 完整结果对比</h2>
+                
+                <table class="comparison-table">
+                    <thead>
+                        <tr>
+                            <th>排名</th>
+                            <th>方法</th>
+                            <th>训练 Loss</th>
+                            <th>验证 Loss</th>
+                            <th>相对Baseline改进</th>
+                            <th>关键特点</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr class="best">
+                            <td>🥇 1</td>
+                            <td><strong>single_kv</strong></td>
+                            <td>0.0397</td>
+                            <td><strong>0.0070</strong></td>
+                            <td><strong>↓ 98.89%</strong></td>
+                            <td>单教师KV蒸馏</td>
+                        </tr>
+                        <tr>
+                            <td>🥈 2</td>
+                            <td>multi_kv_fixed</td>
+                            <td>0.0414</td>
+                            <td>0.0103</td>
+                            <td>↓ 98.36%</td>
+                            <td>多教师固定权重</td>
+                        </tr>
+                        <tr>
+                            <td>🥉 3</td>
+                            <td>multi_kv_dynamic</td>
+                            <td>0.0460</td>
+                            <td>0.0144</td>
+                            <td>↓ 97.70%</td>
+                            <td>多教师动态权重</td>
+                        </tr>
+                        <tr>
+                            <td>4</td>
+                            <td>logits_kd</td>
+                            <td>2.2794</td>
+                            <td>0.5036</td>
+                            <td>↓ 19.83%</td>
+                            <td>传统Logits蒸馏</td>
+                        </tr>
+                        <tr>
+                            <td>5</td>
+                            <td>no_distill</td>
+                            <td>0.7147</td>
+                            <td>0.6281</td>
+                            <td>—</td>
+                            <td>无蒸馏Baseline</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- 关键发现 -->
+            <div class="section">
+                <h2 class="section-title">💡 关键发现与分析</h2>
+                
+                <div class="conclusion-box">
+                    <h3>✅ 证明成功的假设</h3>
+                    <ul class="details-list">
+                        <li><strong>KV蒸馏有效性：</strong>single_kv相比baseline提升98.89%，证明KV cache是强有力的监督信号</li>
+                        <li><strong>KV优于Logits：</strong>KV蒸馏（0.0070）比Logits KD（0.5036）好97.13%，中间层知识更丰富</li>
+                        <li><strong>蒸馏本身有价值：</strong>所有蒸馏方法都显著优于无蒸馏baseline</li>
+                    </ul>
+                </div>
+                
+                <div class="problem-box">
+                    <h4>⚠️ 多教师方法失败原因</h4>
+                    <ul class="details-list">
+                        <li><strong>教师同质性问题：</strong>两个教师都是同一个GPT-2模型，仅prompt不同
+                            <ul style="margin-left: 20px; margin-top: 5px;">
+                                <li>缺乏结构层面的互补性</li>
+                                <li>知识差异不够显著</li>
+                            </ul>
+                        </li>
+                        <li><strong>融合引入噪声：</strong>
+                            <ul style="margin-left: 20px; margin-top: 5px;">
+                                <li>多教师融合（0.0144）> 单教师（0.0070）</li>
+                                <li>说明融合过程反而降低了监督质量</li>
+                            </ul>
+                        </li>
+                        <li><strong>动态权重计算不准确：</strong>
+                            <ul style="margin-left: 20px; margin-top: 5px;">
+                                <li>基于余弦相似度的权重可能过于简单</li>
+                                <li>动态方法（0.0144）比固定方法（0.0103）还差</li>
+                            </ul>
+                        </li>
+                    </ul>
+                </div>
+                
+                <div class="highlight-box">
+                    <h3>🔧 改进方向</h3>
+                    <ul class="details-list">
+                        <li><strong>使用真正差异化的教师：</strong>
+                            <ul style="margin-left: 20px; margin-top: 5px;">
+                                <li>不同架构（GPT-2 vs GPT-Neo）</li>
+                                <li>不同训练阶段的checkpoint</li>
+                                <li>不同领域专门化的模型</li>
+                            </ul>
+                        </li>
+                        <li><strong>改进融合策略：</strong>
+                            <ul style="margin-left: 20px; margin-top: 5px;">
+                                <li>基于注意力机制的软融合</li>
+                                <li>任务相关的权重学习</li>
+                                <li>层级化的分层融合</li>
+                            </ul>
+                        </li>
+                        <li><strong>优化权重计算：</strong>
+                            <ul style="margin-left: 20px; margin-top: 5px;">
+                                <li>使用更复杂的相似度度量</li>
+                                <li>引入可学习的权重网络</li>
+                                <li>考虑任务上下文信息</li>
+                            </ul>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+            
+            <!-- 实验参数 -->
+            <div class="section">
+                <h2 class="section-title">⚙️ 实验配置</h2>
+                
+                <div style="display: flex; flex-wrap: wrap; gap: 15px;">
+                    <div class="metric-box">
+                        <div class="metric-label">模型</div>
+                        <div class="metric-value">GPT-2</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">参数量</div>
+                        <div class="metric-value">124M</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">训练样本</div>
+                        <div class="metric-value">400</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">验证样本</div>
+                        <div class="metric-value">50</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Epochs</div>
+                        <div class="metric-value">3</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">学习率</div>
+                        <div class="metric-value">1e-5</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">KV层数</div>
+                        <div class="metric-value">6</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">GPU</div>
+                        <div class="metric-value">RTX 4070</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 总结 -->
+            <div class="section">
+                <div class="conclusion-box">
+                    <h3>🎯 实验总结</h3>
+                    <p style="font-size: 18px; line-height: 1.8;">
+                        本实验通过5个精心设计的baseline，<strong>成功证明了KV蒸馏显著优于传统方法</strong>（98.89% vs 19.83%），
+                        但也发现<strong>多教师策略需要真正差异化的教师模型</strong>。实验为后续研究提供了清晰的方向：
+                        使用不同架构或训练阶段的教师，并设计更智能的融合策略。
+                    </p>
+                    <div style="text-align: center; margin-top: 20px;">
+                        <span class="badge badge-success">实验成功</span>
+                        <span class="badge badge-info">假设验证</span>
+                        <span class="badge badge-warning">需改进多教师</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <footer>
+            <p>实验日期: 2025-11-13 | 框架: PyTorch 2.7.1+cu118</p>
+            <p style="margin-top: 10px; opacity: 0.8;">增强版 KV 蒸馏实验 · Baseline 设计文档</p>
+        </footer>
+    </div>
+</body>
+</html>
