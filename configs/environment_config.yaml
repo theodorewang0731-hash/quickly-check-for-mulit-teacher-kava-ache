@@ -1,0 +1,195 @@
+# ====================================================================
+# KAVA 环境自适应配置文件
+# 支持本地开发、HPC 集群、云平台等多种环境
+# ====================================================================
+
+# 环境类型：auto (自动检测) / local / hpc / cloud
+environment_type: auto
+
+# ====================================================================
+# 硬件检测策略
+# ====================================================================
+hardware:
+  # GPU 检测策略
+  gpu_detection:
+    # 优先级：cuda > rocm > mps > cpu
+    auto_detect: true
+    fallback_to_cpu: false  # 如果没有 GPU 是否回退到 CPU
+    
+    # 多卡策略
+    multi_gpu_strategy: auto  # auto / ddp / single
+    gpu_selection: auto  # auto / [0,1,2] / "CUDA_VISIBLE_DEVICES"
+    
+    # 内存管理
+    memory_fraction: 0.95  # 允许使用的最大显存比例
+    allow_growth: true     # 动态增长显存
+    
+  # 精度策略（自动根据硬件选择）
+  precision:
+    auto_detect: true
+    fallback: fp32  # fp32 / fp16 / bf16
+    
+    # 硬件支持映射
+    supported_dtypes:
+      A100: [bf16, fp16, fp32]
+      A40: [bf16, fp16, fp32]
+      V100: [fp16, fp32]
+      T4: [fp16, fp32]
+      RTX4090: [bf16, fp16, fp32]
+      RTX4070: [bf16, fp16, fp32]
+      RTX3090: [fp16, fp32]
+
+# ====================================================================
+# 模型维度自适应
+# ====================================================================
+model_dimensions:
+  # 动态检测策略
+  auto_detect: true
+  
+  # KV Cache 提取策略
+  kv_extraction:
+    method: cross_layer_aggregation  # cross_layer_aggregation / last_layer / weighted
+    detect_at_runtime: true  # 运行时检测实际维度
+    
+    # 异常处理
+    on_dimension_mismatch: auto_adapt  # auto_adapt / error / warn
+    
+  # Projector 初始化策略
+  projector:
+    initialization: dynamic  # dynamic / static
+    detect_input_dim: true   # 测试输入自动检测
+    detect_output_dim: true
+    
+    # 安全检查
+    validate_shapes: true
+    test_forward_pass: true  # 初始化后测试前向传播
+
+# ====================================================================
+# 路径自适应（支持不同文件系统）
+# ====================================================================
+paths:
+  # 路径解析策略
+  auto_detect: true
+  
+  # 环境变量映射
+  env_vars:
+    models: KAVA_MODEL_PATH
+    data: KAVA_DATA_PATH
+    cache: KAVA_CACHE_PATH
+    output: KAVA_OUTPUT_PATH
+  
+  # 默认路径（相对于项目根目录）
+  defaults:
+    models: ./local_models
+    data: ./local_data
+    cache: ./cache
+    output: ./outputs
+    checkpoints: ./checkpoints
+  
+  # HPC 常见路径模式
+  hpc_patterns:
+    - /scratch/{username}/kava
+    - /home/{username}/projects/kava
+    - /data/{username}/kava
+    - /work/{username}/kava
+
+# ====================================================================
+# 依赖检测
+# ====================================================================
+dependencies:
+  # 自动检测可用库
+  auto_detect: true
+  
+  # 必需依赖
+  required:
+    - torch
+    - transformers
+    - datasets
+  
+  # 可选依赖（自动检测并适配）
+  optional:
+    accelerate: true    # 多卡训练
+    bitsandbytes: true  # 量化
+    flash_attn: false   # Flash Attention
+    deepspeed: false    # DeepSpeed
+    wandb: false        # 日志系统
+  
+  # 版本兼容性检查
+  version_check: true
+  min_versions:
+    torch: "2.0.0"
+    transformers: "4.36.0"
+
+# ====================================================================
+# 训练配置自适应
+# ====================================================================
+training:
+  # 根据硬件自动调整
+  auto_tune: true
+  
+  # Batch Size 自适应
+  batch_size:
+    auto_detect: true
+    strategy: max_fit  # max_fit / conservative / fixed
+    base_size: 2
+    max_size: 32
+    
+  # 梯度累积自适应
+  gradient_accumulation:
+    auto_compute: true  # 自动计算以达到目标 batch size
+    target_batch_size: 32
+  
+  # 精度自适应
+  mixed_precision:
+    auto_select: true
+    prefer: bf16  # bf16 > fp16 > fp32
+
+# ====================================================================
+# 日志与监控
+# ====================================================================
+logging:
+  # 自动检测可用的日志系统
+  auto_detect: true
+  
+  # 支持的后端
+  backends:
+    tensorboard: auto
+    wandb: auto
+    mlflow: auto
+  
+  # 输出配置
+  console_output: true
+  file_output: true
+  log_level: INFO  # DEBUG / INFO / WARNING / ERROR
+
+# ====================================================================
+# 错误处理
+# ====================================================================
+error_handling:
+  # 环境不兼容时的策略
+  on_incompatible_env: adapt  # adapt / error / warn
+  
+  # 维度不匹配时的策略
+  on_dimension_error: auto_fix  # auto_fix / error / warn
+  
+  # GPU 不可用时的策略
+  on_no_gpu: error  # error / warn / use_cpu
+  
+  # 内存不足时的策略
+  on_oom: reduce_batch  # reduce_batch / error / checkpoint
+
+# ====================================================================
+# 性能优化
+# ====================================================================
+optimization:
+  # 编译优化（PyTorch 2.0+）
+  torch_compile: auto  # auto / true / false
+  
+  # 内存优化
+  gradient_checkpointing: auto
+  
+  # 数据加载优化
+  dataloader:
+    num_workers: auto  # auto 会根据 CPU 核心数选择
+    pin_memory: auto   # GPU 训练时自动启用
+    prefetch_factor: 2
