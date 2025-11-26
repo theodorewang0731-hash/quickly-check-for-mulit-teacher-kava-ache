@@ -27,17 +27,24 @@ import json
 
 class KVDimensionProjector(nn.Module):
     """
-    Learnable linear projection for aligning teacher KV dimensions to student.
+    Elastic Bottleneck Projector for aligning teacher KV dimensions to student.
     
     Design Philosophy:
-        - Per-teacher granularity: Each teacher has its own W_K, W_V
-        - Layer-shared: All layers of same teacher use same projection
-        - Separate K/V: Independent projections for keys and values
+        - Per-teacher granularity: Each teacher has its own adapter
+        - Elastic MLP: Adjustable width based on model size (<30B use 1.0, ~70B use 2.0)
+        - Pre-LayerNorm: Essential for numerical stability across model sizes
+        - Non-linear: SiLU activation for better feature transformation
+        
+    Architecture:
+        Pre-LayerNorm -> Linear(d_t, hidden) -> SiLU -> Dropout -> Linear(hidden, d_s)
         
     Args:
         teacher_configs: Dict mapping teacher_name -> {"d_model": int, "num_layers": int}
         student_d_model: Student hidden dimension
-        init_method: "xavier" | "orthogonal" | "identity_scale"
+        mlp_ratio: Hidden layer expansion ratio (0.5=compress, 1.0=same, 2.0=expand)
+                   Recommended: <30B use 1.0, ~70B use 2.0
+        dropout: Dropout rate for regularization
+        init_method: "xavier" | "kaiming" | "normal"
         trainable: Whether to train projections during distillation
     """
     
@@ -45,6 +52,8 @@ class KVDimensionProjector(nn.Module):
         self,
         teacher_configs: Dict[str, Dict[str, int]],
         student_d_model: int,
+        mlp_ratio: float = 1.0,
+        dropout: float = 0.1,
         init_method: str = "xavier",
         trainable: bool = True
     ):
@@ -52,12 +61,17 @@ class KVDimensionProjector(nn.Module):
         
         self.teacher_configs = teacher_configs
         self.student_d_model = student_d_model
+        self.mlp_ratio = mlp_ratio
+        self.dropout = dropout
         self.init_method = init_method
         self.trainable = trainable
         
-        # Create projections for each teacher
+        # Create adapters for each teacher
         self.projectors = nn.ModuleDict()
         self.teacher_name_mapping = {}  # Map clean names to original names
+        
+        print(f"\n[Initializing Elastic Bottleneck Projector]")
+        print(f"   MLP Ratio: {mlp_ratio}x | Dropout: {dropout} | Output: {student_d_model}")
         
         for teacher_name, config in teacher_configs.items():
             teacher_d_model = config["d_model"]
@@ -66,59 +80,90 @@ class KVDimensionProjector(nn.Module):
             clean_name = teacher_name.replace(".", "_").replace("-", "_")
             self.teacher_name_mapping[clean_name] = teacher_name
             
-            # Create K and V projections
-            proj_K = nn.Linear(teacher_d_model, student_d_model, bias=False)
-            proj_V = nn.Linear(teacher_d_model, student_d_model, bias=False)
+            # Calculate hidden dimension based on MLP ratio
+            # 70B models: use 2.0x for complex features
+            # 7B-14B models: use 1.0x or 0.5x for efficiency
+            hidden_dim = int(teacher_d_model * mlp_ratio)
             
-            # Initialize
-            self._initialize_projection(proj_K, teacher_d_model, student_d_model)
-            self._initialize_projection(proj_V, teacher_d_model, student_d_model)
+            # Create K and V adapters with Elastic Bottleneck architecture
+            adapter_K = nn.Sequential(
+                # [Critical 1] Pre-LayerNorm: Stabilize gradients regardless of model size
+                nn.LayerNorm(teacher_d_model),
+                
+                # [Critical 2] Transformation layers (Up/Down projection)
+                nn.Linear(teacher_d_model, hidden_dim),
+                
+                # [Critical 3] Non-linear activation (SiLU)
+                nn.SiLU(),
+                
+                nn.Dropout(dropout),
+                
+                # Final projection to student dimension
+                nn.Linear(hidden_dim, student_d_model)
+            )
+            
+            adapter_V = nn.Sequential(
+                nn.LayerNorm(teacher_d_model),
+                nn.Linear(teacher_d_model, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, student_d_model)
+            )
             
             # Set trainable
-            proj_K.requires_grad_(trainable)
-            proj_V.requires_grad_(trainable)
+            for p in adapter_K.parameters():
+                p.requires_grad_(trainable)
+            for p in adapter_V.parameters():
+                p.requires_grad_(trainable)
             
             self.projectors[clean_name] = nn.ModuleDict({
-                "K": proj_K,
-                "V": proj_V
+                "K": adapter_K,
+                "V": adapter_V
             })
+            
+            print(f"   Teacher: {teacher_name}")
+            print(f"     d_model: {teacher_d_model} -> hidden: {hidden_dim} -> output: {student_d_model}")
         
-        print(f"✓ KVDimensionProjector initialized:")
+        # Initialize weights
+        if trainable:
+            self._initialize_weights()
+        
+        print(f"\n[Elastic Bottleneck Projector Initialized]")
         print(f"  Teachers: {list(teacher_configs.keys())}")
         print(f"  Student d_model: {student_d_model}")
+        print(f"  MLP ratio: {mlp_ratio}x")
         print(f"  Init method: {init_method}")
         print(f"  Trainable: {trainable}")
         print(f"  Total params: {self.count_parameters():,}")
     
-    def _initialize_projection(self, linear: nn.Linear, d_in: int, d_out: int):
-        """Initialize projection matrix based on init_method."""
-        
-        if self.init_method == "xavier":
-            nn.init.xavier_uniform_(linear.weight)
-        
-        elif self.init_method == "orthogonal":
-            nn.init.orthogonal_(linear.weight)
-        
-        elif self.init_method == "identity_scale":
-            # For d_in > d_out: truncate identity
-            # For d_in < d_out: pad identity with scaled random
-            with torch.no_grad():
-                if d_in == d_out:
-                    linear.weight.copy_(torch.eye(d_out, d_in))
-                elif d_in > d_out:
-                    # Truncate: take first d_out dimensions
-                    linear.weight.copy_(torch.eye(d_out, d_in))
+    def _initialize_weights(self):
+        """Initialize weights based on init_method (Xavier/Kaiming/Normal)."""
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                if self.init_method == "xavier":
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                
+                elif self.init_method == "kaiming":
+                    nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                
+                elif self.init_method == "normal":
+                    nn.init.normal_(module.weight, std=0.02)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                
                 else:
-                    # Pad: identity + scaled random
-                    linear.weight.zero_()
-                    linear.weight[:, :d_in].copy_(torch.eye(d_in))
-                    # Fill remaining with small random values
-                    if d_out > d_in:
-                        scale = 0.01
-                        linear.weight[:, d_in:].normal_(0, scale)
-        
-        else:
-            raise ValueError(f"Unknown init_method: {self.init_method}")
+                    # Default: Xavier
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
     
     def project_teacher_kv(
         self,
@@ -201,18 +246,20 @@ class KVDimensionProjector(nn.Module):
         state = {
             "teacher_configs": self.teacher_configs,
             "student_d_model": self.student_d_model,
+            "mlp_ratio": self.mlp_ratio,
+            "dropout": self.dropout,
             "init_method": self.init_method,
             "trainable": self.trainable,
             "state_dict": self.state_dict()
         }
         torch.save(state, path)
-        print(f"✓ Saved projections to {path}")
+        print(f"[Saved projections to {path}]")
     
     def load_projections(self, path: str):
         """Load projection weights from file."""
         state = torch.load(path, map_location="cpu")
         self.load_state_dict(state["state_dict"])
-        print(f"✓ Loaded projections from {path}")
+        print(f"[Loaded projections from {path}]")
     
     @staticmethod
     def from_pretrained(path: str) -> "KVDimensionProjector":
@@ -221,6 +268,8 @@ class KVDimensionProjector(nn.Module):
         projector = KVDimensionProjector(
             teacher_configs=state["teacher_configs"],
             student_d_model=state["student_d_model"],
+            mlp_ratio=state.get("mlp_ratio", 1.0),  # Backward compatibility
+            dropout=state.get("dropout", 0.1),
             init_method=state["init_method"],
             trainable=state["trainable"]
         )
