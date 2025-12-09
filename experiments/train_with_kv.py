@@ -48,8 +48,37 @@ from experiments.alignment_v2 import (
 )
 import torch.nn as nn
 
+# v4.0 Map Projection imports
+from src.map_projection_aligner import MapProjectionAligner
+
 
 # ========== Core Functions ==========
+
+def stack_past_kv(past_key_values, as_tensor=True):
+    """
+    将 tuple of (k, v) 转为 [L, 2, B, H, T, D] 张量用于 MapProjectionAligner
+    
+    Args:
+        past_key_values: tuple of (k, v) pairs, each k/v shape [B, H, T, D]
+        as_tensor: 是否返回 torch.Tensor (否则返回 numpy)
+    
+    Returns:
+        stacked_kv: [L, 2, B, H, T, D]
+    """
+    kvs = []
+    for k, v in past_key_values:
+        if isinstance(k, np.ndarray):
+            k = torch.from_numpy(k)
+        if isinstance(v, np.ndarray):
+            v = torch.from_numpy(v)
+        # 确保在同一设备
+        if k.device != v.device:
+            v = v.to(k.device)
+        kvs.append(torch.stack([k, v], dim=0))  # [2, B, H, T, D]
+    
+    stacked = torch.stack(kvs, dim=0)  # [L, 2, B, H, T, D]
+    return stacked if as_tensor else stacked.cpu().numpy()
+
 
 def to_numpy_kv(past_key_values):
     """Convert tensors in past_key_values to numpy for downstream compression utils."""
@@ -110,6 +139,14 @@ def parse_args():
     p.add_argument("--use_cka_layer_mapping", action="store_true", help="Use CKA-based layer mapping (Alignment v2)")
     p.add_argument("--layer_mapping_path", type=str, default=None, help="Path to precomputed layer mapping JSON")
     p.add_argument("--use_segment_resampling", action="store_true", help="Use segment-aware time resampling (Alignment v2)")
+    
+    # v4.0 Map Projection (Anti-Flatten Structured Alignment)
+    p.add_argument("--alignment_mode", type=str, default="flat", choices=["flat", "structured"], 
+                   help="Alignment mode: 'flat' (baseline) or 'structured' (v4.0 map projection)")
+    p.add_argument("--map_proj_share_dim", action="store_true", 
+                   help="Share dimension projection across heads (v4.0)")
+    p.add_argument("--map_proj_init_uniform", action="store_true",
+                   help="Uniform initialization for head mixer (v4.0)")
     
     p.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
     p.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every N steps")
@@ -274,6 +311,13 @@ def main():
         )
         layer_mapper.load_mapping(args.layer_mapping_path)
         print("✓ CKA layer mapping loaded")
+    
+    # v4.0 Map Projection Aligner (will be initialized lazily on first batch)
+    map_aligner = None
+    if args.alignment_mode == "structured":
+        print(f"\n[v4.0 Map Projection] Will initialize structured aligner on first batch")
+        print(f"  - share_dim_proj: {args.map_proj_share_dim}")
+        print(f"  - init_uniform: {args.map_proj_init_uniform}")
 
     examples = build_dataset(args, tokenizer)
 
@@ -390,7 +434,8 @@ def main():
                 comp = shuffled_kv(comp)
 
             # lazily build projectors matching teacher KV feature dims
-            if projectors is None:
+            if projectors is None and args.alignment_mode == "flat":
+                # Baseline mode: use old projectors
                 proj_list = []
                 def feat_dim_of(k):
                     import numpy as _np
@@ -416,6 +461,46 @@ def main():
                 projectors = nn.ModuleList(proj_list)
                 # recreate optimizer to include projector params
                 optimizer = torch.optim.AdamW(list(student.parameters()) + list(projectors.parameters()), lr=args.lr)
+            
+            # v4.0: Lazily initialize MapProjectionAligner
+            if map_aligner is None and args.alignment_mode == "structured":
+                # Extract dimensions from first batch
+                sample_k, sample_v = comp[0]
+                if isinstance(sample_k, np.ndarray):
+                    sample_k = torch.from_numpy(sample_k).to(device)
+                if isinstance(sample_v, np.ndarray):
+                    sample_v = torch.from_numpy(sample_v).to(device)
+                
+                # sample_k shape: [B, H_t, T, D_t]
+                num_teacher_layers = len(comp)
+                num_student_layers = student.config.num_hidden_layers
+                num_teacher_heads = sample_k.shape[1]
+                num_student_heads = student.config.num_attention_heads
+                teacher_head_dim = sample_k.shape[-1]
+                student_head_dim = student.config.hidden_size // student.config.num_attention_heads
+                
+                print(f"\n[v4.0 Aligner Init] T_layers={num_teacher_layers}, S_layers={num_student_layers}")
+                print(f"  T_heads={num_teacher_heads}, S_heads={num_student_heads}")
+                print(f"  T_head_dim={teacher_head_dim}, S_head_dim={student_head_dim}")
+                
+                map_aligner = MapProjectionAligner(
+                    num_teacher_layers=num_teacher_layers,
+                    num_student_layers=num_student_layers,
+                    num_teacher_heads=num_teacher_heads,
+                    num_student_heads=num_student_heads,
+                    teacher_head_dim=teacher_head_dim,
+                    student_head_dim=student_head_dim,
+                    mode="structured",
+                    share_dim_proj=args.map_proj_share_dim,
+                    init_uniform=args.map_proj_init_uniform
+                ).to(device)
+                
+                # Recreate optimizer to include aligner params
+                optimizer = torch.optim.AdamW(
+                    list(student.parameters()) + list(map_aligner.parameters()), 
+                    lr=args.lr
+                )
+                print(f"✓ MapProjectionAligner initialized with {sum(p.numel() for p in map_aligner.parameters())} params")
 
             # forward student with output_hidden_states and output_attentions (for attention weighting)
             s_out = student(
@@ -439,45 +524,95 @@ def main():
             ce_loss = ce_loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
             kv_loss_total = torch.tensor(0.0, device=device)
-            # for simplicity, average kv loss across layers
-            layer_losses = []
-            for layer_idx, layer in enumerate(comp):
-                teacher_k, teacher_v = layer
-                tk, student_seg = align_teacher_kv_to_student((teacher_k, teacher_v), student_hidden, method='right_crop')
-                # project student_segment to teacher feat dim
-                proj = projectors[layer_idx]
-                student_proj = proj(student_seg)
-                # student_proj: (batch, sel_len, feat), tk: (batch, sel_len, feat)
+            
+            # ========== 双模式对齐分支 ==========
+            if args.alignment_mode == "structured":
+                # v4.0 Structured Alignment: Map Projection (Anti-Flatten)
+                # 1. 准备输入: 将 comp (numpy/mixed) 转为统一的 torch tensor
+                teacher_kv_list = []
+                for k, v in comp:
+                    if isinstance(k, np.ndarray):
+                        k = torch.from_numpy(k).to(device)
+                    if isinstance(v, np.ndarray):
+                        v = torch.from_numpy(v).to(device)
+                    teacher_kv_list.append((k, v))
                 
-                # Attention-weighted KV loss (稳健小升级)
-                # Use warmup: only enable after N steps to avoid unstable early student attention
-                use_attn_weighting = (
-                    args.use_attention_weighted_kv 
-                    and global_step >= args.attention_weighted_kv_warmup
+                # Stack to [L, 2, B, H, T, D]
+                teacher_k_stack = torch.stack([kv[0] for kv in teacher_kv_list], dim=0)  # [L, B, H, T, D]
+                teacher_v_stack = torch.stack([kv[1] for kv in teacher_kv_list], dim=0)
+                
+                # 2. 获取 student KV (需要从 forward 中获取)
+                # NOTE: 这里需要重新 forward student 以获取 past_key_values
+                with torch.no_grad():
+                    s_out_kv = student(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=True
+                    )
+                student_pkv = s_out_kv.past_key_values
+                student_k_stack = torch.stack([kv[0] for kv in student_pkv], dim=0)
+                student_v_stack = torch.stack([kv[1] for kv in student_pkv], dim=0)
+                
+                # 3. 创建 segment_ids (假设整个序列为单个 segment)
+                # Shape: [B, T] - 全 0 表示所有 token 属于 segment 0
+                segment_ids = torch.zeros(input_ids.shape[0], input_ids.shape[1], 
+                                         dtype=torch.long, device=device)
+                
+                # 4. Map Projection Alignment
+                aligned_k, aligned_v, attn_map = map_aligner(
+                    teacher_k_stack,  # [L_t, B, H_t, T, D_t]
+                    teacher_v_stack,
+                    None,  # Q not needed for KV-only loss
+                    segment_ids
                 )
                 
-                if use_attn_weighting:
-                    # Choose attention source: teacher (more stable) or student (more aligned)
-                    attn_source = teacher_attention if args.use_teacher_attention else student_attention
-                    
-                    if attn_source is not None:
-                        l = compute_kv_loss(
-                            student_proj, 
-                            tk, 
-                            loss_type=args.kv_loss, 
-                            alpha2=args.alpha2,
-                            attention_weights=attn_source  # Pass attention for weighting (will be detached inside)
-                        )
-                    else:
-                        # Fallback to unweighted if attention not available
-                        l = compute_kv_loss(student_proj, tk, loss_type=args.kv_loss, alpha2=args.alpha2)
-                else:
-                    # Original unweighted KV loss (baseline or during warmup)
-                    l = compute_kv_loss(student_proj, tk, loss_type=args.kv_loss, alpha2=args.alpha2)
+                # 5. Compute KV loss: MSE between aligned teacher and student
+                # aligned_k: [L_s, B, H_s, T_s, D_s]
+                # student_k_stack: [L_s, B, H_s, T_s, D_s]
+                kv_loss_k = F.mse_loss(aligned_k, student_k_stack)
+                kv_loss_v = F.mse_loss(aligned_v, student_v_stack)
+                kv_loss_total = (kv_loss_k + kv_loss_v) / 2.0
                 
-                layer_losses.append(l)
-            if len(layer_losses) > 0:
-                kv_loss_total = torch.stack(layer_losses).mean()
+            else:
+                # Baseline mode: Flat alignment (original pipeline)
+                layer_losses = []
+                for layer_idx, layer in enumerate(comp):
+                    teacher_k, teacher_v = layer
+                    tk, student_seg = align_teacher_kv_to_student((teacher_k, teacher_v), student_hidden, method='right_crop')
+                    # project student_segment to teacher feat dim
+                    proj = projectors[layer_idx]
+                    student_proj = proj(student_seg)
+                    # student_proj: (batch, sel_len, feat), tk: (batch, sel_len, feat)
+                    
+                    # Attention-weighted KV loss (稳健小升级)
+                    # Use warmup: only enable after N steps to avoid unstable early student attention
+                    use_attn_weighting = (
+                        args.use_attention_weighted_kv 
+                        and global_step >= args.attention_weighted_kv_warmup
+                    )
+                    
+                    if use_attn_weighting:
+                        # Choose attention source: teacher (more stable) or student (more aligned)
+                        attn_source = teacher_attention if args.use_teacher_attention else student_attention
+                        
+                        if attn_source is not None:
+                            l = compute_kv_loss(
+                                student_proj, 
+                                tk, 
+                                loss_type=args.kv_loss, 
+                                alpha2=args.alpha2,
+                                attention_weights=attn_source  # Pass attention for weighting (will be detached inside)
+                            )
+                        else:
+                            # Fallback to unweighted if attention not available
+                            l = compute_kv_loss(student_proj, tk, loss_type=args.kv_loss, alpha2=args.alpha2)
+                    else:
+                        # Original unweighted KV loss (baseline or during warmup)
+                        l = compute_kv_loss(student_proj, tk, loss_type=args.kv_loss, alpha2=args.alpha2)
+                    
+                    layer_losses.append(l)
+                if len(layer_losses) > 0:
+                    kv_loss_total = torch.stack(layer_losses).mean()
 
             # CODI proxy: MSE between student_hidden and teacher_hidden
             codi_loss = F.mse_loss(student_hidden, teacher_hidden)
@@ -531,8 +666,11 @@ def main():
                 if args.cka_weight > 0:
                     log_msg += f", CKA={cka_loss.item():.4f}"
                 
+                # Alignment mode indicator
+                log_msg += f" [Mode: {args.alignment_mode}]"
+                
                 # Attention weighting status
-                if args.use_attention_weighted_kv:
+                if args.use_attention_weighted_kv and args.alignment_mode == "flat":
                     if global_step >= args.attention_weighted_kv_warmup:
                         attn_src = "Teacher-Attn" if args.use_teacher_attention else "Student-Attn"
                         log_msg += f" [{attn_src}-weighted]"
@@ -548,6 +686,8 @@ def main():
                 student.save_pretrained(ckpt)
                 if projectors is not None:
                     torch.save(projectors.state_dict(), os.path.join(ckpt, 'projectors.pt'))
+                if map_aligner is not None:
+                    torch.save(map_aligner.state_dict(), os.path.join(ckpt, 'map_aligner.pt'))
                 print(f"Checkpoint saved at step {global_step}")
 
         # Epoch summary
@@ -560,6 +700,8 @@ def main():
         student.save_pretrained(ckpt)
         if projectors is not None:
             torch.save(projectors.state_dict(), os.path.join(ckpt, 'projectors.pt'))
+        if map_aligner is not None:
+            torch.save(map_aligner.state_dict(), os.path.join(ckpt, 'map_aligner.pt'))
         
         # save epoch summary to log
         log_file = os.path.join(args.output_dir, 'training_log.txt')
@@ -578,6 +720,10 @@ def main():
         f.write(f'Subset size: {args.subset_size}\n')
         f.write(f'Epochs: {args.epochs}\n')
         f.write(f'Batch size: {args.batch_size}\n')
+        f.write(f'Alignment mode: {args.alignment_mode}\n')  # v4.0 新增
+        if args.alignment_mode == "structured":
+            f.write(f'  - share_dim_proj: {args.map_proj_share_dim}\n')
+            f.write(f'  - init_uniform: {args.map_proj_init_uniform}\n')
         f.write(f'KV method: {args.kv_method}\n')
         if args.kv_method == 'rkv_official':
             f.write(f'  R-KV lambda (importance weight): {args.rkv_lambda}\n')
