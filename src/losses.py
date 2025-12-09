@@ -26,6 +26,7 @@ Date: 2025-01-18
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 class MercatorKVLoss(nn.Module):
@@ -164,6 +165,200 @@ class HybridKVLoss(nn.Module):
         }
         
         return total_loss, metrics
+
+
+class StructuralKVLoss(nn.Module):
+    """
+    结构化 KV 损失：K/V 方向对齐 + Q-K 交互对齐
+    
+    ✨ v4.0 设计：
+    - K/V：使用余弦相似度（方向对齐）
+    - Q：不直接对齐 Q 向量，而是对齐 Q-K 交互（attention 分布）
+    
+    这样 Q 的语义被编码在"它如何查询 K"上，而不是单纯的向量差。
+    
+    Args:
+        alpha_k: K 对齐权重
+        alpha_v: V 对齐权重  
+        alpha_attn: Attention KL 权重
+        temperature: Attention softmax 温度（用于平滑分布）
+        epsilon: 数值稳定性常数
+    
+    Example:
+        >>> loss_fn = StructuralKVLoss(
+        ...     alpha_k=1.0, alpha_v=1.0, alpha_attn=0.5
+        ... )
+        >>> loss, metrics = loss_fn(s_k, s_v, s_q, t_k, t_v, t_q)
+    """
+    
+    def __init__(
+        self,
+        alpha_k: float = 1.0,
+        alpha_v: float = 1.0,
+        alpha_attn: float = 0.5,
+        temperature: float = 1.0,
+        epsilon: float = 1e-8
+    ):
+        super().__init__()
+        self.alpha_k = alpha_k
+        self.alpha_v = alpha_v
+        self.alpha_attn = alpha_attn
+        self.temperature = temperature
+        self.epsilon = epsilon
+        
+        print(f"[StructuralKVLoss Initialized]")
+        print(f"  alpha_k (K alignment):    {alpha_k}")
+        print(f"  alpha_v (V alignment):    {alpha_v}")
+        print(f"  alpha_attn (Attn KL):     {alpha_attn}")
+        print(f"  temperature:              {temperature}")
+    
+    def forward(
+        self,
+        s_k: torch.Tensor,
+        s_v: torch.Tensor,
+        s_q: torch.Tensor,
+        t_k: torch.Tensor,
+        t_v: torch.Tensor,
+        t_q: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ):
+        """
+        计算结构化 KV 损失
+        
+        Args:
+            s_k, s_v, s_q: Student 的 K/V/Q，形状 [B, L, H, T, D]
+            t_k, t_v, t_q: Teacher 的 K/V/Q（已投影到 student 空间），形状同上
+            attention_mask: 可选的 mask，形状 [B, T]
+        
+        Returns:
+            total_loss: 标量损失
+            metrics: 详细指标字典
+        """
+        # --- 1. K 对齐（方向）---
+        if self.alpha_k > 0:
+            s_k_norm = F.normalize(s_k, p=2, dim=-1)
+            t_k_norm = F.normalize(t_k, p=2, dim=-1)
+            k_cos_sim = (s_k_norm * t_k_norm).sum(dim=-1).mean()
+            k_loss = 1.0 - k_cos_sim
+        else:
+            k_loss = torch.tensor(0.0, device=s_k.device)
+            k_cos_sim = torch.tensor(0.0, device=s_k.device)
+        
+        # --- 2. V 对齐（方向）---
+        if self.alpha_v > 0:
+            s_v_norm = F.normalize(s_v, p=2, dim=-1)
+            t_v_norm = F.normalize(t_v, p=2, dim=-1)
+            v_cos_sim = (s_v_norm * t_v_norm).sum(dim=-1).mean()
+            v_loss = 1.0 - v_cos_sim
+        else:
+            v_loss = torch.tensor(0.0, device=s_v.device)
+            v_cos_sim = torch.tensor(0.0, device=s_v.device)
+        
+        # --- 3. Q-K 交互对齐（Attention KL）---
+        if self.alpha_attn > 0:
+            attn_loss = self._compute_attention_kl(
+                s_q, s_k, t_q, t_k, attention_mask
+            )
+        else:
+            attn_loss = torch.tensor(0.0, device=s_k.device)
+        
+        # --- 4. 总损失 ---
+        total_loss = (
+            self.alpha_k * k_loss +
+            self.alpha_v * v_loss +
+            self.alpha_attn * attn_loss
+        )
+        
+        # --- 5. 指标 ---
+        metrics = {
+            'k_loss': k_loss.item(),
+            'v_loss': v_loss.item(),
+            'attn_loss': attn_loss.item(),
+            'k_cos_sim': k_cos_sim.item() if self.alpha_k > 0 else 0.0,
+            'v_cos_sim': v_cos_sim.item() if self.alpha_v > 0 else 0.0,
+            'total_loss': total_loss.item()
+        }
+        
+        return total_loss, metrics
+    
+    def _compute_attention_kl(
+        self,
+        s_q: torch.Tensor,
+        s_k: torch.Tensor,
+        t_q: torch.Tensor,
+        t_k: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        计算 Q-K 交互的 KL 散度
+        
+        比较：
+        - Student Q 查询 Student K 的分布
+        - Teacher Q 查询 Teacher K 的分布（投影后）
+        
+        Args:
+            s_q, s_k: Student Q/K，形状 [B, L, H, T, D]
+            t_q, t_k: Teacher Q/K（已投影），形状同上
+            attention_mask: 可选 mask，[B, T]
+        
+        Returns:
+            kl_loss: 标量
+        """
+        B, L, H, T, D = s_q.shape
+        
+        # 计算 attention scores：Q @ K^T / sqrt(D)
+        # [B, L, H, T, D] @ [B, L, H, D, T] -> [B, L, H, T, T]
+        s_scores = torch.matmul(
+            s_q, s_k.transpose(-1, -2)
+        ) / (D ** 0.5)
+        
+        t_scores = torch.matmul(
+            t_q, t_k.transpose(-1, -2)
+        ) / (D ** 0.5)
+        
+        # 应用 mask（如果提供）
+        if attention_mask is not None:
+            # mask: [B, T] -> [B, 1, 1, T, 1]
+            mask = attention_mask.unsqueeze(1).unsqueeze(1).unsqueeze(-1)
+            s_scores = s_scores.masked_fill(~mask, float('-inf'))
+            t_scores = t_scores.masked_fill(~mask, float('-inf'))
+        
+        # Softmax 转换为概率分布
+        s_attn_probs = F.softmax(s_scores / self.temperature, dim=-1)
+        t_attn_probs = F.softmax(t_scores / self.temperature, dim=-1)
+        
+        # KL 散度：KL(Teacher || Student)
+        # 注意：PyTorch 的 kl_div 期望 log(student) 和 teacher
+        kl_loss = F.kl_div(
+            s_attn_probs.log(),
+            t_attn_probs,
+            reduction='batchmean',
+            log_target=False
+        )
+        
+        return kl_loss
+
+
+# ===== 便捷创建函数 =====
+
+def create_mercator_loss(alpha=1.0, beta=0.0):
+    """创建 Mercator 损失（单教师，flatten 路径）"""
+    return MercatorKVLoss(alpha=alpha, beta=beta)
+
+
+def create_structural_loss(
+    alpha_k=1.0,
+    alpha_v=1.0,
+    alpha_attn=0.5,
+    temperature=1.0
+):
+    """创建结构化损失（新方案，地图投影路径）"""
+    return StructuralKVLoss(
+        alpha_k=alpha_k,
+        alpha_v=alpha_v,
+        alpha_attn=alpha_attn,
+        temperature=temperature
+    )
 
 
 # ============================================================================
