@@ -36,7 +36,10 @@ from types import SimpleNamespace
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from experiments.kv_utils import full_kv, right_crop_kv, rkv_greedy
-from experiments.rkv_official import rkv_compress_with_attention
+try:
+    from experiments.rkv_official import rkv_compress_with_attention
+except ImportError:
+    rkv_compress_with_attention = None
 from experiments.kv_loss import align_teacher_kv_to_student, compute_kv_loss, shuffled_kv
 from experiments.projector import StudentToTeacherProjector
 from experiments.cka_loss import multi_layer_cka_loss

@@ -24,6 +24,17 @@ import torch.nn as nn
 from typing import Dict, Tuple, Optional, List
 import json
 
+# Import head projector for handling num_heads mismatch
+try:
+    from experiments.kv_head_projector import KVProjector, get_kv_heads_from_tensor
+    HAS_HEAD_PROJECTOR = True
+except ImportError:
+    # Fallback: will skip head projection if not available
+    print("[WARNING] kv_head_projector not found, head mismatch handling disabled")
+    KVProjector = None
+    get_kv_heads_from_tensor = None
+    HAS_HEAD_PROJECTOR = False
+
 
 class KVDimensionProjector(nn.Module):
     """
@@ -69,6 +80,11 @@ class KVDimensionProjector(nn.Module):
         # Create adapters for each teacher
         self.projectors = nn.ModuleDict()
         self.teacher_name_mapping = {}  # Map clean names to original names
+        
+        # Head projectors for handling num_heads mismatch (GQA/MQA)
+        self.head_projectors = nn.ModuleDict()
+        self._head_projectors_initialized = False
+        self.student_num_kv_heads = 2  # Default, will be updated dynamically
         
         print(f"\n[Initializing Elastic Bottleneck Projector]")
         print(f"   MLP Ratio: {mlp_ratio}x | Dropout: {dropout} | Output: {student_d_model}")
@@ -176,12 +192,16 @@ class KVDimensionProjector(nn.Module):
         
         Args:
             teacher_name: Which teacher (e.g., "Qwen2-7B")
-            teacher_K: shape [B, num_layers, T, d_teacher]
-            teacher_V: shape [B, num_layers, T, d_teacher]
+            teacher_K: shape [B, num_layers, T, d_teacher] or [B, num_layers, H_t, T, d_head_t]
+            teacher_V: shape [B, num_layers, T, d_teacher] or [B, num_layers, H_t, T, d_head_t]
         
         Returns:
             (K_aligned, V_aligned): Both [B, num_layers, T, d_student]
         """
+        
+        # Step 0: Handle head mismatch (if K/V are 4D or 5D with heads)
+        if HAS_HEAD_PROJECTOR and (teacher_K.dim() == 4 or teacher_K.dim() == 5):
+            teacher_K, teacher_V = self._project_heads(teacher_name, teacher_K, teacher_V)
         
         # Map to clean name
         clean_name = teacher_name.replace(".", "_").replace("-", "_")
@@ -200,6 +220,78 @@ class KVDimensionProjector(nn.Module):
         V_aligned = proj_V(teacher_V)
         
         return K_aligned, V_aligned
+    
+    def _project_heads(
+        self,
+        teacher_name: str,
+        K: torch.Tensor,
+        V: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Project teacher KV heads to student KV heads (handles GQA/MQA mismatch).
+        
+        Args:
+            K: [B, H_t, T, D_t] or [B, L, H_t, T, D_t]
+            V: Same as K
+        
+        Returns:
+            K_proj, V_proj with student head count
+        """
+        if not HAS_HEAD_PROJECTOR:
+            return K, V
+        
+        # Get actual KV head counts from tensor
+        if K.dim() == 4:
+            # [B, H, T, D] format
+            Ht = K.shape[1]
+            Dt = K.shape[3]
+        elif K.dim() == 5:
+            # [B, L, H, T, D] format
+            Ht = K.shape[2]
+            Dt = K.shape[4]
+        else:
+            return K, V  # Can't handle this format
+        
+        clean_name = teacher_name.replace(".", "_").replace("-", "_")
+        
+        # Initialize head projector if needed
+        if clean_name not in self.head_projectors:
+            # Use 2 as default for small student models (common in GQA)
+            Hs = self.student_num_kv_heads
+            Ds = Dt  # Keep head_dim same initially
+            
+            print(f"[KV Head Projector] Initializing for {teacher_name}: "
+                  f"Ht={Ht} -> Hs={Hs}, Dt={Dt} -> Ds={Ds}")
+            
+            self.head_projectors[clean_name] = KVProjector(
+                Ht=Ht, Hs=Hs, Dt=Dt, Ds=Ds, share_kv=True
+            ).to(K.device)
+            
+            if not self.trainable:
+                # Freeze if parent projector is frozen
+                for param in self.head_projectors[clean_name].parameters():
+                    param.requires_grad = False
+        
+        # Apply head projection
+        projector = self.head_projectors[clean_name]
+        
+        if K.dim() == 4:
+            # [B, H, T, D] -> [B, H_s, T, D_s]
+            K_proj, V_proj = projector(K, V)
+        elif K.dim() == 5:
+            # [B, L, H, T, D] -> process each layer
+            B, L, H, T, D = K.shape
+            K_list, V_list = [], []
+            for l in range(L):
+                K_l, V_l = projector(K[:, l], V[:, l])
+                K_list.append(K_l.unsqueeze(1))
+                V_list.append(V_l.unsqueeze(1))
+            K_proj = torch.cat(K_list, dim=1)
+            V_proj = torch.cat(V_list, dim=1)
+        else:
+            K_proj, V_proj = K, V
+        
+        return K_proj, V_proj
     
     def project_multi_teacher_kv(
         self,

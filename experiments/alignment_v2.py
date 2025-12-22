@@ -28,6 +28,96 @@ from experiments.cka_loss import linear_cka
 
 
 # ============================================================================
+# Safe Time Resampling Utilities (Fix for Index Out of Bounds)
+# ============================================================================
+
+def safe_time_resample(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """
+    安全的时间维重采样 (避免越界)
+    
+    Args:
+        x: [B, H, T_in, D] 或 [B, T_in, D]
+        indices: [B, T_out] 或 [T_out], 每个值在 [0, T_in-1] 范围内
+    
+    Returns:
+        [B, H, T_out, D] 或 [B, T_out, D]
+    """
+    device = x.device
+    is_4d = x.dim() == 4
+    
+    if is_4d:
+        B, H, T_in, D = x.shape
+    else:
+        B, T_in, D = x.shape
+        H = None
+    
+    # 确保 indices 在正确设备上
+    indices = indices.to(device=device)
+    
+    # 转换为 long 类型
+    indices = indices.long()
+    
+    # Clamp 到合法范围
+    indices = indices.clamp(0, T_in - 1)
+    
+    # 处理 indices 的 shape
+    if indices.dim() == 1:
+        # [T_out] -> [B, T_out]
+        indices = indices.unsqueeze(0).expand(B, -1)
+    
+    T_out = indices.shape[1]
+    
+    if is_4d:
+        # 扩展 indices 用于 gather: [B, H, T_out, D]
+        idx = indices[:, None, :, None].expand(B, H, T_out, D)
+        return torch.gather(x, dim=2, index=idx)
+    else:
+        # 扩展 indices 用于 gather: [B, T_out, D]
+        idx = indices[:, :, None].expand(B, T_out, D)
+        return torch.gather(x, dim=1, index=idx)
+
+
+def build_safe_linear_indices(B: int, T_in: int, T_out: int, device: torch.device) -> torch.Tensor:
+    """
+    生成线性插值的索引 (避免天然越界)
+    
+    处理边界情况:
+    - T_in = 0: 返回空张量
+    - T_in = 1: 所有索引指向 0
+    - T_out = 1: 返回中间位置
+    
+    Args:
+        B: batch size
+        T_in: 输入序列长度
+        T_out: 输出序列长度
+        device: torch device
+    
+    Returns:
+        indices: [B, T_out], dtype=long
+    """
+    # 边界情况 1: 输入为空
+    if T_in == 0:
+        return torch.zeros(B, T_out, device=device, dtype=torch.long)
+    
+    # 边界情况 2: 输入只有 1 个 token
+    if T_in == 1:
+        return torch.zeros(B, T_out, device=device, dtype=torch.long)
+    
+    # 边界情况 3: 输出只有 1 个 token
+    if T_out == 1:
+        mid = T_in // 2
+        return torch.full((B, 1), mid, device=device, dtype=torch.long)
+    
+    # 正常情况: 线性插值
+    # 浮点生成, 再 round, 再 clamp
+    base = torch.linspace(0, T_in - 1, steps=T_out, device=device)  # [T_out]
+    idx = torch.round(base).long().clamp(0, T_in - 1)  # [T_out]
+    
+    # 扩展到 batch
+    return idx.unsqueeze(0).expand(B, -1)  # [B, T_out]
+
+
+# ============================================================================
 # Part 1: 时间维对齐 v2 - Segment-aware Resampling
 # ============================================================================
 
@@ -197,32 +287,27 @@ def _global_resample(
     heads: Optional[int],
     head_dim: Optional[int]
 ) -> torch.Tensor:
-    """全局等比例重采样（简单版）"""
+    """全局等比例重采样（简单版）- 使用安全 gather"""
     batch, teacher_len, dim = teacher_kv_flat.shape
+    device = teacher_kv_flat.device
     
-    # Compute sampling positions
+    # 边界情况处理
+    if teacher_len == 0:
+        # 输入为空，返回零填充
+        result = torch.zeros(batch, student_length, dim, device=device, dtype=teacher_kv_flat.dtype)
+        if is_4d:
+            result = result.reshape(batch, student_length, heads, head_dim).transpose(1, 2)
+        return result
+    
     if teacher_len == 1:
-        # Edge case: teacher only has 1 token
+        # 输入只有 1 token，重复
         resampled = teacher_kv_flat.repeat(1, student_length, 1)
     else:
-        # u_i = i / (student_length - 1) * (teacher_len - 1)
-        student_positions = torch.arange(student_length, device=teacher_kv_flat.device, dtype=torch.float32)
-        teacher_positions = student_positions / max(student_length - 1, 1) * max(teacher_len - 1, 1)
+        # 使用安全的线性索引生成
+        indices = build_safe_linear_indices(batch, teacher_len, student_length, device)
         
-        # j = floor(u_i), λ = u_i - j
-        teacher_indices = teacher_positions.long()
-        lambdas = teacher_positions - teacher_indices.float()
-        
-        # Clamp indices
-        teacher_indices = torch.clamp(teacher_indices, 0, teacher_len - 2)
-        next_indices = teacher_indices + 1
-        
-        # Linear interpolation: (1 - λ) * KV_j + λ * KV_{j+1}
-        kv_j = teacher_kv_flat[:, teacher_indices, :]  # (batch, student_length, dim)
-        kv_j_next = teacher_kv_flat[:, next_indices, :]
-        
-        lambdas = lambdas.view(1, -1, 1)  # (1, student_length, 1)
-        resampled = (1 - lambdas) * kv_j + lambdas * kv_j_next
+        # 安全重采样 (不会越界)
+        resampled = safe_time_resample(teacher_kv_flat, indices)
     
     # Reshape back to 4D if needed
     if is_4d:
@@ -253,21 +338,41 @@ def _segment_aware_resample(
         
         if teacher_seg is None:
             # Fallback: use global resampling for this segment
-            seg_resampled = _global_resample(
-                teacher_kv_flat[:, :student_seg.length, :],
-                student_seg.length,
-                False, None, None
-            )
+            # 边界检查：确保不访问越界
+            seg_len = min(student_seg.length, teacher_kv_flat.shape[1])
+            if seg_len == 0:
+                # 空段，创建零填充
+                seg_resampled = torch.zeros(
+                    batch, student_seg.length, dim,
+                    device=device, dtype=teacher_kv_flat.dtype
+                )
+            else:
+                seg_resampled = _global_resample(
+                    teacher_kv_flat[:, :seg_len, :],
+                    student_seg.length,
+                    False, None, None
+                )
         else:
             # Extract teacher segment KV
-            teacher_seg_kv = teacher_kv_flat[:, teacher_seg.start:teacher_seg.end, :]
+            # 边界检查：确保 start/end 不越界
+            seg_start = max(0, min(teacher_seg.start, teacher_len))
+            seg_end = max(seg_start, min(teacher_seg.end, teacher_len))
             
-            # Resample this segment
-            seg_resampled = _global_resample(
-                teacher_seg_kv,
-                student_seg.length,
-                False, None, None
-            )
+            if seg_start >= seg_end:
+                # 空段或无效段，创建零填充
+                seg_resampled = torch.zeros(
+                    batch, student_seg.length, dim,
+                    device=device, dtype=teacher_kv_flat.dtype
+                )
+            else:
+                teacher_seg_kv = teacher_kv_flat[:, seg_start:seg_end, :]
+                
+                # Resample this segment
+                seg_resampled = _global_resample(
+                    teacher_seg_kv,
+                    student_seg.length,
+                    False, None, None
+                )
         
         resampled_parts.append(seg_resampled)
     
